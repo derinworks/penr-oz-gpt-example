@@ -117,8 +117,11 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
 
 if __name__ == "__main__":
     # User selection
-    user_selection = input('Choose (S) generate samples or (T) perform training:').upper()
+    user_selection = (input('Choose (S) generate samples or (T) perform training: (default: S)') or "S").upper()
     print(f"{user_selection=}")
+    # Device selection
+    device_selection = input('Choose device: (default: cpu)') or 'cpu'
+    print(f"{device_selection=}")
 
     # Read example in
     with open("example.txt", "r", encoding="utf-8") as f:
@@ -136,28 +139,29 @@ if __name__ == "__main__":
     if model_resp.status_code == 404:
         init_w = {"normal": {"mean": 0.0, "std": 0.02}}
         init_b = {"zeros": {}}
+        device = {"device": device_selection}
         create_model_request = model_request | {
             "layers":
                 [{"summation": [
-                    {"embedding": {"num_embeddings": vocab_size, "embedding_dim": embed_depth}} | init_w,
-                    {"position": {"num_embeddings": block_size, "embedding_dim": embed_depth}} | init_w]},
+                    {"embedding": {"num_embeddings": vocab_size, "embedding_dim": embed_depth} | device} | init_w,
+                    {"position": {"num_embeddings": block_size, "embedding_dim": embed_depth} | device} | init_w]},
                  {"dropout": {"p": dropout}}] +
                 [{"residual": [
                     {"sequential": [
-                        {"layernorm": {"normalized_shape": embed_depth}},
+                        {"layernorm": {"normalized_shape": embed_depth} | device},
                         {"attention": {"embedding_dim": embed_depth, "num_heads": attn_heads, "block_size": block_size,
-                                       "bias": False, "dropout": dropout}} | init_w]
+                                       "bias": False, "dropout": dropout} | device} | init_w]
                     },
                     {"sequential": [
-                        {"layernorm": {"normalized_shape": embed_depth}},
-                        {"linear": {"in_features": embed_depth, "out_features": 4 * embed_depth}} | init_w | init_b,
+                        {"layernorm": {"normalized_shape": embed_depth} | device},
+                        {"linear": {"in_features": embed_depth, "out_features": 4 * embed_depth} | device} | init_w | init_b,
                         {"gelu": {}},
-                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth}} | init_w | init_b,
+                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth} | device} | init_w | init_b,
                         {"dropout": {"p": dropout}}]
                     }]}
                 ] * tran_layers +
-                [{"layernorm": {"normalized_shape": embed_depth}},
-                 {"linear": {"in_features": embed_depth, "out_features": vocab_size}},
+                [{"layernorm": {"normalized_shape": embed_depth} | device},
+                 {"linear": {"in_features": embed_depth, "out_features": vocab_size} | device},
                  {"softmaxlast": {"dim": -1}}],
             "optimizer": {
                 "adamw": {"lr": 3e-4}
@@ -189,9 +193,9 @@ if __name__ == "__main__":
             print(f"{''.join(vocabulary[ix] for ix in x)} --> {''.join(vocabulary[iy] for iy in y)}")
 
         # Ask for training options
-        num_training_epochs = int(input('How many epochs shall we perform training?'))
+        num_training_epochs = int(input('How many epochs shall we perform training? (default: 1)') or 1)
         print(f"{num_training_epochs=}")
-        batch_size = int(input('Set batch size='))
+        batch_size = int(input('Set batch size=(default: 64)') or 64)
         print(f"{batch_size=}")
 
         # Run training on split
@@ -206,7 +210,7 @@ if __name__ == "__main__":
 
     else: # Generate sample
         # Ask for number of maximum tokens
-        max_new_tokens = int(input('How many new tokens at most would you like?'))
+        max_new_tokens = int(input('How many new tokens at most would you like? (default: 10)') or 10)
         print(f"{max_new_tokens=}")
         # Generate tokens
         context = torch.zeros((1, 1), dtype=torch.long)
