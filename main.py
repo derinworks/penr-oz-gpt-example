@@ -73,21 +73,19 @@ def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list
     print(f"Evaluate cost for data of size {num_eval_items} to average over {eval_epochs} epochs "
           f"with batch size {eval_batch_size}")
 
-    costs = torch.zeros(eval_epochs)
-    for eval_i in range(eval_epochs):
-        batch_indices = torch.randint(len(input_data), (eval_batch_size,))
-        cost_request = model_request | {
-            "input": [input_data[batch_idx] for batch_idx in batch_indices],
-            "target": [target[batch_idx] for batch_idx in batch_indices],
-        }
-        resp = requests.post(f"{prediction_server_url}/output/", json=cost_request)
+    cost_request = model_request | {
+        "input": input_data,
+        "target": target,
+        "epochs": eval_epochs,
+        "batch_size": eval_batch_size,
+    }
+    resp = requests.post(f"{prediction_server_url}/evaluate/", json=cost_request)
 
-        if resp.status_code == 200:
-            costs[eval_i] = resp.json()['cost']
-        else:
-            raise RuntimeError(f"Failed to calculate cost: {resp.status_code} - {resp.json()}")
-
-    return costs.mean().item()
+    if resp.status_code == 200:
+        cost = resp.json()['cost']
+        return cost
+    else:
+        raise RuntimeError(f"Failed to calculate cost: {resp.status_code} - {resp.json()}")
 
 def run_training(training_epochs: int, train_batch_size: int, input_data: list[list[int]], target: list[list[int]]):
     # Prepare training request parameters
