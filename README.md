@@ -34,6 +34,10 @@ Implementation of an example GPT for understanding how next character is generat
 
 4. **Neural Network Service**:
    - **Follow instructions** on [Quick Start Guide](https://github.com/derinworks/penr-oz-neural-network-v2-torch-nn?tab=readme-ov-file#quickstart-guide)
+   - **Deployed remotely** then use a `.env` file as such to configure url:
+    ```dotenv
+    PREDICTION_SERVER_URL=http://???:8000
+    ```
 
 5. **Run**:
    ```bash
