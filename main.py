@@ -1,26 +1,19 @@
+import os
 import time
 from typing import Tuple
-
-import torch
 from requests import Response
 import requests
+from dotenv import load_dotenv
+
+# load any env file
+load_dotenv()
 
 # Prepare Prediction server config
-prediction_server_url = "http://127.0.0.1:8000"
+prediction_server_url = os.environ.get("PREDICTION_SERVER_URL", "http://127.0.0.1:8000")
+print(f"{prediction_server_url=}")
 model_request = {
     "model_id": "gpt-example"
 }
-# declare block context size
-block_size = 64
-# embedding depth number of dimensions
-embed_depth = 96
-# number of attention heads
-attn_heads = 2
-# number of transformer layers
-tran_layers = 2
-# drop out ratio
-dropout = 0.05
-
 
 def make_training_data(source_data: list[int]) -> Tuple[list[list[int]], list[list[int]]]:
     end = len(source_data) - block_size
@@ -137,6 +130,10 @@ if __name__ == "__main__":
     device_selection = input('Choose device: (default: cpu)') or 'cpu'
     print(f"{device_selection=}")
 
+    # Configure block context size
+    block_size = 256 if device_selection == 'cuda' else 64
+    print(f"{block_size=}")
+
     # Read example in
     with open("example.txt", "r", encoding="utf-8") as f:
         example = f.read()
@@ -151,9 +148,29 @@ if __name__ == "__main__":
     # Create prediction model if not already
     model_resp = request_prediction_progress(0, 1)
     if model_resp.status_code == 404:
+        # embedding depth number of dimensions
+        embed_depth = 384 if device_selection == 'cuda' else 96
+        print(f"{embed_depth=}")
+        # number of attention heads
+        attn_heads = 6 if device_selection == 'cuda' else 2
+        print(f"{attn_heads=}")
+        # number of transformer layers
+        tran_layers = 6 if device_selection == 'cuda' else 2
+        print(f"{tran_layers=}")
+        # drop out ratio
+        dropout = 0.2 if device_selection == 'cuda' else 0.05
+        print(f"{dropout=}")
+        # learning rate
+        learning_rate = 3e-4
+        print(f"{learning_rate=}")
+        # init parameters config
         init_w = {"normal": {"mean": 0.0, "std": 0.02}}
+        print(f"{init_w=}")
         init_b = {"zeros": {}}
+        print(f"{init_b=}")
+        # device selection
         device = {"device": device_selection}
+        # create model
         create_model_request = model_request | {
             "layers":
                 [{"summation": [
@@ -178,7 +195,7 @@ if __name__ == "__main__":
                  {"linear": {"in_features": embed_depth, "out_features": vocab_size} | device},
                  {"softmaxlast": {"dim": -1}}],
             "optimizer": {
-                "adamw": {"lr": 3e-4}
+                "adamw": {"lr": learning_rate}
             }
         }
         create_model_resp = requests.post(f"{prediction_server_url}/model/", json=create_model_request)
