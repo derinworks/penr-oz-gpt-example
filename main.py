@@ -113,6 +113,22 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
     # mark end of training request
     print(f"###### Finished Training Round ########")
 
+def generate(input_context: list[list[int]], max_new_tokens: int) -> list[int]:
+    print(f"Generating up to {max_new_tokens} new tokens")
+
+    generate_request = model_request | {
+        "input": input_context,
+        "block_size": block_size,
+        "max_new_tokens": max_new_tokens,
+    }
+    resp = requests.post(f"{prediction_server_url}/generate/", json=generate_request)
+
+    if resp.status_code == 200:
+        tokens = resp.json()['tokens']
+        return tokens
+    else:
+        raise RuntimeError(f"Failed to generate tokens: {resp.status_code} - {resp.json()}")
+
 if __name__ == "__main__":
     # User selection
     user_selection = (input('Choose (S) generate samples or (T) perform training: (default: S)') or "S").upper()
@@ -208,19 +224,10 @@ if __name__ == "__main__":
 
     else: # Generate sample
         # Ask for number of maximum tokens
-        max_new_tokens = int(input('How many new tokens at most would you like? (default: 10)') or 10)
-        print(f"{max_new_tokens=}")
+        num_new_tokens_requested = int(input('How many new tokens at most would you like? (default: 10)') or 10)
+        print(f"{num_new_tokens_requested=}")
         # Generate tokens
-        context = torch.zeros((1, 1), dtype=torch.long)
-        for sample_idx in range(max_new_tokens):
-            # crop context to the last block size tokens
-            cropped_context = context[:, -block_size:]
-            # Predict next token
-            probs = make_prediction(cropped_context.tolist())
-            next_idx = torch.multinomial(torch.tensor(probs), num_samples=1)
-            # Append next token in for next prediction
-            context = torch.cat((context, next_idx), dim=1)
+        encoded_sample = generate([[0]], num_new_tokens_requested)
         # Present generated decoded sample
-        encoded_sample = context[0].tolist()
         decoded_sample = ''.join([vocabulary[i] for i in encoded_sample])
         print(decoded_sample)
