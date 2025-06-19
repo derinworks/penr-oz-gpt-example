@@ -20,7 +20,7 @@ def make_training_data(source_data: list[int]) -> Tuple[list[list[int]], list[li
     return ([source_data[i:i + block_size] for i in range(end)],
             [source_data[i + 1:i + block_size + 1] for i in range(end)])
 
-def request_prediction_progress(delay_secs = 5, timeout_secs = 900, log_prefix = "") -> Response:
+def request_prediction_progress(delay_secs = 0, timeout_secs = 1, log_prefix = "") -> Response:
     # keep requesting until condition met or times out
     for _ in range(timeout_secs // max(1, delay_secs)):
         if delay_secs > 0: # wait for progress to build up
@@ -44,11 +44,11 @@ def request_prediction_progress(delay_secs = 5, timeout_secs = 900, log_prefix =
                 continue # checking
         else: # barf possible error body
             print(f"{progress_body=}")
-            if progress_resp.status_code == 400: # malformed input
+            if progress_resp.status_code != 404: # any error besides not found
                 continue # checking
         return progress_resp # done
     # timed out
-    raise TimeoutError("Training took too long")
+    raise TimeoutError(f"{log_prefix} took too long")
 
 def make_prediction(input_data: list[list[int]]) -> list[list[float]]:
     prediction_request = model_request | {
@@ -96,13 +96,15 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
     print(f"Prepared training data of size {num_train_items} to run for {training_epochs} epochs "
           f"with batch size {train_batch_size}")
 
-    timeout_secs = max(training_epochs, 10)
-
     # Submit training request to prediction service
     training_resp = requests.put(f"{prediction_server_url}/train/", json=training_request)
     print(f"Submitted: {training_resp.status_code} - {training_resp.json()}")
     # check progress
-    request_prediction_progress(timeout_secs=timeout_secs)
+    delay_secs = 60 if device_selection == 'cuda' else 5
+    print(f"{delay_secs=}")
+    timeout_secs = max(training_epochs, 10) * (5 if device_selection == 'cuda' else 1)
+    print(f"{timeout_secs=}")
+    request_prediction_progress(delay_secs, timeout_secs, "Training...")
     # mark end of training request
     print(f"###### Finished Training Round ########")
 
@@ -131,7 +133,7 @@ if __name__ == "__main__":
     print(f"{device_selection=}")
 
     # Configure block context size
-    block_size = 256 if device_selection == 'cuda' else 64
+    block_size = 128 if device_selection == 'cuda' else 64
     print(f"{block_size=}")
 
     # Read example in
@@ -146,16 +148,16 @@ if __name__ == "__main__":
     print(f"{s2i=}")
 
     # Create prediction model if not already
-    model_resp = request_prediction_progress(0, 1)
+    model_resp = request_prediction_progress(log_prefix="Checking...")
     if model_resp.status_code == 404:
         # embedding depth number of dimensions
-        embed_depth = 384 if device_selection == 'cuda' else 96
+        embed_depth = 192 if device_selection == 'cuda' else 96
         print(f"{embed_depth=}")
         # number of attention heads
-        attn_heads = 6 if device_selection == 'cuda' else 2
+        attn_heads = 3 if device_selection == 'cuda' else 2
         print(f"{attn_heads=}")
         # number of transformer layers
-        tran_layers = 6 if device_selection == 'cuda' else 2
+        tran_layers = 3 if device_selection == 'cuda' else 2
         print(f"{tran_layers=}")
         # drop out ratio
         dropout = 0.2 if device_selection == 'cuda' else 0.05
@@ -168,35 +170,34 @@ if __name__ == "__main__":
         print(f"{init_w=}")
         init_b = {"zeros": {}}
         print(f"{init_b=}")
-        # device selection
-        device = {"device": device_selection}
         # create model
         create_model_request = model_request | {
             "layers":
                 [{"summation": [
-                    {"embedding": {"num_embeddings": vocab_size, "embedding_dim": embed_depth} | device} | init_w,
-                    {"position": {"num_embeddings": block_size, "embedding_dim": embed_depth} | device} | init_w]},
+                    {"embedding": {"num_embeddings": vocab_size, "embedding_dim": embed_depth}} | init_w,
+                    {"position": {"num_embeddings": block_size, "embedding_dim": embed_depth}} | init_w]},
                  {"dropout": {"p": dropout}}] +
                 [{"residual": [
                     {"sequential": [
-                        {"layernorm": {"normalized_shape": embed_depth} | device},
+                        {"layernorm": {"normalized_shape": embed_depth}},
                         {"attention": {"embedding_dim": embed_depth, "num_heads": attn_heads, "block_size": block_size,
-                                       "bias": False, "dropout": dropout} | device} | init_w]
+                                       "bias": False, "dropout": dropout}} | init_w]
                     },
                     {"sequential": [
-                        {"layernorm": {"normalized_shape": embed_depth} | device},
-                        {"linear": {"in_features": embed_depth, "out_features": 4 * embed_depth} | device} | init_w | init_b,
+                        {"layernorm": {"normalized_shape": embed_depth}},
+                        {"linear": {"in_features": embed_depth, "out_features": 4 * embed_depth}} | init_w | init_b,
                         {"gelu": {}},
-                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth} | device} | init_w | init_b,
+                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth}} | init_w | init_b,
                         {"dropout": {"p": dropout}}]
                     }]}
                 ] * tran_layers +
-                [{"layernorm": {"normalized_shape": embed_depth} | device},
-                 {"linear": {"in_features": embed_depth, "out_features": vocab_size} | device},
+                [{"layernorm": {"normalized_shape": embed_depth}},
+                 {"linear": {"in_features": embed_depth, "out_features": vocab_size}},
                  {"softmaxlast": {"dim": -1}}],
             "optimizer": {
                 "adamw": {"lr": learning_rate}
-            }
+            },
+            "device": device_selection,
         }
         create_model_resp = requests.post(f"{prediction_server_url}/model/", json=create_model_request)
         print(f"{create_model_resp.status_code} - {create_model_resp.json()}")
@@ -214,7 +215,8 @@ if __name__ == "__main__":
         print(f"{num_split_train_items=}")
         num_split_val_items = int(0.1 * num_items)
         print(f"{num_split_val_items=}")
-        split_train_data = encoded_example[:num_split_train_items]
+        split_train_data = encoded_example[:num_split_train_items] * (5 if device_selection == 'cuda' else 1)
+        print(f"{len(split_train_data)=}")
         split_val_data = encoded_example[num_split_train_items:]
         # Build training data
         input_train, target_train = make_training_data(split_train_data)
