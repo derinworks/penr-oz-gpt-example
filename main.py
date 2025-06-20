@@ -1,9 +1,20 @@
+import gzip
+import json
 import os
 import time
 from typing import Tuple
 from requests import Response
 import requests
 from dotenv import load_dotenv
+import logging
+
+# configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
 
 # load any env file
 load_dotenv()
@@ -28,7 +39,7 @@ def request_prediction_progress(delay_secs = 0, timeout_secs = 1, log_prefix = "
         # check progress
         progress_resp = requests.get(f"{prediction_server_url}/progress/", params=model_request)
         progress_status, progress_body = progress_resp.status_code, progress_resp.json()
-        print(f"{log_prefix}{progress_status=}")
+        log.info(f"{log_prefix}{progress_status=}")
         if progress_resp.status_code == 200:
             if len(progress_body["progress"]) > 0: # log info about progress
                 costs = [progress["cost"] for progress in progress_body["progress"]]
@@ -43,7 +54,7 @@ def request_prediction_progress(delay_secs = 0, timeout_secs = 1, log_prefix = "
             if model_status == "Training":
                 continue # checking
         else: # barf possible error body
-            print(f"{progress_body=}")
+            log.error(f"{progress_body=}")
             if progress_resp.status_code != 404: # any error besides not found
                 continue # checking
         return progress_resp # done
@@ -63,8 +74,8 @@ def make_prediction(input_data: list[list[int]]) -> list[list[float]]:
 
 def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list[int]], target: list[list[int]]) -> float:
     num_eval_items = len(input_data)
-    print(f"Evaluate cost for data of size {num_eval_items} to average over {eval_epochs} epochs "
-          f"with batch size {eval_batch_size}")
+    log.info(f"Evaluate cost for data of size {num_eval_items} to average over {eval_epochs} epochs "
+             f"with batch size {eval_batch_size}")
 
     cost_request = model_request | {
         "input": input_data,
@@ -72,13 +83,20 @@ def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list
         "epochs": eval_epochs,
         "batch_size": eval_batch_size,
     }
-    resp = requests.post(f"{prediction_server_url}/evaluate/", json=cost_request)
 
-    if resp.status_code == 200:
-        cost = resp.json()['cost']
+    if compress_request:
+        compressed_cost_request = gzip.compress(json.dumps(cost_request).encode("utf-8"))
+        log.info(f"Compressed cost request for data of size {num_eval_items}")
+        cost_resp = requests.post(f"{prediction_server_url}/evaluate/", data=compressed_cost_request,
+                              headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
+    else:
+        cost_resp = requests.post(f"{prediction_server_url}/evaluate/", json=cost_request)
+
+    if cost_resp.status_code == 200:
+        cost = cost_resp.json()['cost']
         return cost
     else:
-        raise RuntimeError(f"Failed to calculate cost: {resp.status_code} - {resp.json()}")
+        raise RuntimeError(f"Failed to calculate cost: {cost_resp.status_code} - {cost_resp.json()}")
 
 def run_training(training_epochs: int, train_batch_size: int, input_data: list[list[int]], target: list[list[int]]):
     # Prepare training request parameters
@@ -93,12 +111,18 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
         "input": input_data,
         "target": target,
     }
-    print(f"Prepared training data of size {num_train_items} to run for {training_epochs} epochs "
-          f"with batch size {train_batch_size}")
+    log.info(f"Prepared training data of size {num_train_items} to run for {training_epochs} epochs "
+             f"with batch size {train_batch_size}")
 
     # Submit training request to prediction service
-    training_resp = requests.put(f"{prediction_server_url}/train/", json=training_request)
-    print(f"Submitted: {training_resp.status_code} - {training_resp.json()}")
+    if compress_request:
+        compressed_training_request = gzip.compress(json.dumps(training_request).encode("utf-8"))
+        log.info(f"Compressed training request for data of size {num_train_items}")
+        training_resp = requests.put(f"{prediction_server_url}/train/", data=compressed_training_request,
+                                     headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
+    else:
+        training_resp = requests.put(f"{prediction_server_url}/train/", json=training_request)
+    log.info(f"Submitted: {training_resp.status_code} - {training_resp.json()}")
     # check progress
     delay_secs = 60 if device_selection == 'cuda' else 5
     print(f"{delay_secs=}")
@@ -200,7 +224,7 @@ if __name__ == "__main__":
             "device": device_selection,
         }
         create_model_resp = requests.post(f"{prediction_server_url}/model/", json=create_model_request)
-        print(f"{create_model_resp.status_code} - {create_model_resp.json()}")
+        log.info(f"{create_model_resp.status_code} - {create_model_resp.json()}")
     elif model_resp.status_code != 200:
         raise RuntimeError(f"Prediction Service error: {model_resp.status_code} - {model_resp.json()}")
 
@@ -222,7 +246,7 @@ if __name__ == "__main__":
         input_train, target_train = make_training_data(split_train_data)
         input_val, target_val = make_training_data(split_val_data)
         # Preview training data
-        for x, y in zip(input_train[:5], target_train[:5]):
+        for x, y in zip(input_train[:2], target_train[:2]):
             print(f"{''.join(vocabulary[ix] for ix in x)} --> {''.join(vocabulary[iy] for iy in y)}")
 
         # Ask for training options
@@ -230,6 +254,8 @@ if __name__ == "__main__":
         print(f"{num_training_epochs=}")
         batch_size = int(input('Set batch size=(default: 64)') or 64)
         print(f"{batch_size=}")
+        compress_request = (input('Compress request payload?(default: N)') or 'N').upper() == 'Y'
+        print(f"{compress_request=}")
 
         # Run training on split
         run_training(num_training_epochs, batch_size, input_train, target_train)
@@ -237,9 +263,9 @@ if __name__ == "__main__":
         # Calculate cost on splits
         num_eval_epochs = max(1, num_training_epochs // 10)
         split_train_cost = calculate_cost(num_eval_epochs, batch_size, input_train, target_train)
-        print(f"{split_train_cost=}")
+        log.info(f"{split_train_cost=}")
         split_val_cost = calculate_cost(num_eval_epochs, batch_size, input_val, target_val)
-        print(f"{split_val_cost=}")
+        log.info(f"{split_val_cost=}")
 
     else: # Generate sample
         # Ask for number of maximum tokens
