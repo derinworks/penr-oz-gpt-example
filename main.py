@@ -1,5 +1,7 @@
 import gzip
+from io import BytesIO
 import json
+import math
 import os
 import time
 from typing import Tuple
@@ -7,6 +9,7 @@ from requests import Response
 import requests
 from dotenv import load_dotenv
 import logging
+from tqdm import tqdm
 
 # configure logging
 logging.basicConfig(
@@ -72,6 +75,20 @@ def make_prediction(input_data: list[list[int]]) -> list[list[float]]:
 
     raise RuntimeError(f"Failed to receive a good prediction: {resp.status_code} - {resp.json()}")
 
+def compress_with_progress(data: dict, chunk_size: int = 1024) -> bytes:
+    # Convert JSON to bytes
+    json_bytes = json.dumps(data).encode("utf-8")
+    total = len(json_bytes)
+
+    # Output buffer for gzip-compressed data
+    buf = BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
+        for i in tqdm(range(0, total, chunk_size), desc="Compressing", unit="B", unit_scale=True):
+            chunk = json_bytes[i:i+chunk_size]
+            gz.write(chunk)
+
+    return buf.getvalue()
+
 def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list[int]], target: list[list[int]]) -> float:
     num_eval_items = len(input_data)
     log.info(f"Evaluate cost for data of size {num_eval_items} to average over {eval_epochs} epochs "
@@ -85,7 +102,8 @@ def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list
     }
 
     if compress_request:
-        compressed_cost_request = gzip.compress(json.dumps(cost_request).encode("utf-8"))
+        log.info(f"Compressing evaluation request ...")
+        compressed_cost_request = compress_with_progress(cost_request)
         log.info(f"Compressed cost request for data of size {num_eval_items}")
         cost_resp = requests.post(f"{prediction_server_url}/evaluate/", data=compressed_cost_request,
                               headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
@@ -116,7 +134,8 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
 
     # Submit training request to prediction service
     if compress_request:
-        compressed_training_request = gzip.compress(json.dumps(training_request).encode("utf-8"))
+        log.info(f"Compressing training request ...")
+        compressed_training_request = compress_with_progress(training_request)
         log.info(f"Compressed training request for data of size {num_train_items}")
         training_resp = requests.put(f"{prediction_server_url}/train/", data=compressed_training_request,
                                      headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
@@ -126,7 +145,7 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
     # check progress
     delay_secs = 60 if device_selection == 'cuda' else 5
     print(f"{delay_secs=}")
-    timeout_secs = max(training_epochs, 10) * (5 if device_selection == 'cuda' else 1)
+    timeout_secs = max(training_epochs, 10) * (18 if device_selection == 'cuda' else 1)
     print(f"{timeout_secs=}")
     request_prediction_progress(delay_secs, timeout_secs, "Training...")
     # mark end of training request
@@ -157,7 +176,7 @@ if __name__ == "__main__":
     print(f"{device_selection=}")
 
     # Configure block context size
-    block_size = 128 if device_selection == 'cuda' else 64
+    block_size = 256 if device_selection == 'cuda' else 64
     print(f"{block_size=}")
 
     # Read example in
@@ -175,13 +194,13 @@ if __name__ == "__main__":
     model_resp = request_prediction_progress(log_prefix="Checking...")
     if model_resp.status_code == 404:
         # embedding depth number of dimensions
-        embed_depth = 192 if device_selection == 'cuda' else 96
+        embed_depth = 384 if device_selection == 'cuda' else 96
         print(f"{embed_depth=}")
         # number of attention heads
-        attn_heads = 3 if device_selection == 'cuda' else 2
+        attn_heads = 6 if device_selection == 'cuda' else 2
         print(f"{attn_heads=}")
         # number of transformer layers
-        tran_layers = 3 if device_selection == 'cuda' else 2
+        tran_layers = 6 if device_selection == 'cuda' else 2
         print(f"{tran_layers=}")
         # drop out ratio
         dropout = 0.2 if device_selection == 'cuda' else 0.05
@@ -192,6 +211,7 @@ if __name__ == "__main__":
         # init parameters config
         init_w = {"normal": {"mean": 0.0, "std": 0.02}}
         print(f"{init_w=}")
+        init_proj_w = {"normal": {"mean": 0.0, "std": 0.02 / math.sqrt(2 * tran_layers)}}
         init_b = {"zeros": {}}
         print(f"{init_b=}")
         # create model
@@ -204,19 +224,21 @@ if __name__ == "__main__":
                 [{"residual": [
                     {"sequential": [
                         {"layernorm": {"normalized_shape": embed_depth}},
-                        {"attention": {"embedding_dim": embed_depth, "num_heads": attn_heads, "block_size": block_size,
-                                       "bias": False, "dropout": dropout}} | init_w]
+                        {"linear": {"in_features": embed_depth, "out_features": 3 * embed_depth}} | init_w | init_b,
+                        {"attention": {"num_heads": attn_heads, "dropout": dropout}},
+                        {"linear": {"in_features": embed_depth, "out_features": embed_depth}} | init_proj_w | init_b,
+                        {"dropout": {"p": dropout}}]
                     },
                     {"sequential": [
                         {"layernorm": {"normalized_shape": embed_depth}},
                         {"linear": {"in_features": embed_depth, "out_features": 4 * embed_depth}} | init_w | init_b,
                         {"gelu": {}},
-                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth}} | init_w | init_b,
+                        {"linear": {"in_features": 4 * embed_depth, "out_features": embed_depth}} | init_proj_w | init_b,
                         {"dropout": {"p": dropout}}]
-                    }]}
-                ] * tran_layers +
+                    }
+                ]} for _ in range(tran_layers)] +
                 [{"layernorm": {"normalized_shape": embed_depth}},
-                 {"linear": {"in_features": embed_depth, "out_features": vocab_size}},
+                 {"linear": {"in_features": embed_depth, "out_features": vocab_size, "bias": False}},
                  {"softmaxlast": {"dim": -1}}],
             "optimizer": {
                 "adamw": {"lr": learning_rate}
