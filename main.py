@@ -31,8 +31,8 @@ model_request = {
 
 def make_training_data(source_data: list[int]) -> Tuple[list[list[int]], list[list[int]]]:
     end = len(source_data) - block_size
-    return ([source_data[i:i + block_size] for i in range(end)],
-            [source_data[i + 1:i + block_size + 1] for i in range(end)])
+    return ([source_data[i:i + block_size] for i in tqdm(range(end), desc="input")],
+            [source_data[i + 1:i + block_size + 1] for i in tqdm(range(end), desc="target")])
 
 def request_prediction_progress(delay_secs = 0, timeout_secs = 1, log_prefix = "") -> Response:
     # keep requesting until condition met or times out
@@ -75,19 +75,29 @@ def make_prediction(input_data: list[list[int]]) -> list[list[float]]:
 
     raise RuntimeError(f"Failed to receive a good prediction: {resp.status_code} - {resp.json()}")
 
-def compress_with_progress(data: dict, chunk_size: int = 1024) -> bytes:
-    # Convert JSON to bytes
-    json_bytes = json.dumps(data).encode("utf-8")
-    total = len(json_bytes)
-
-    # Output buffer for gzip-compressed data
+def compress_with_progress(data: dict, chunk_size: int = 32 * 2**20) -> bytes:
+    # Compress JSON with progress tracking
+    encoder = json.JSONEncoder(separators=(",", ":"), ensure_ascii=False)
     buf = BytesIO()
     with gzip.GzipFile(fileobj=buf, mode='wb') as gz:
-        for i in tqdm(range(0, total, chunk_size), desc="Compressing", unit="B", unit_scale=True):
-            chunk = json_bytes[i:i+chunk_size]
-            gz.write(chunk)
-
-    return buf.getvalue()
+        bar = tqdm(unit="B", unit_scale=True, desc="Compressing")
+        buffer = bytearray()
+        bytes_written = 0
+        for part in encoder.iterencode(data):
+            buffer.extend(part.encode("utf-8"))
+            while len(buffer) >= chunk_size:
+                gz.write(buffer[:chunk_size])
+                bytes_written += chunk_size
+                del buffer[:chunk_size]
+                bar.update(chunk_size)
+        if buffer:
+            gz.write(buffer)
+        bar.close()
+    # show compressed size and return buffer
+    compressed_bytes = buf.getvalue()
+    compressed_size_mb = len(compressed_bytes) / (1024 * 1024)
+    log.info(f"✅ Final compressed size: {compressed_size_mb:.2f} MB")
+    return compressed_bytes
 
 def calculate_cost(eval_epochs: int, eval_batch_size: int, input_data: list[list[int]], target: list[list[int]]) -> float:
     num_eval_items = len(input_data)
@@ -143,9 +153,9 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
         training_resp = requests.put(f"{prediction_server_url}/train/", json=training_request)
     log.info(f"Submitted: {training_resp.status_code} - {training_resp.json()}")
     # check progress
-    delay_secs = 60 if device_selection == 'cuda' else 5
+    delay_secs = 15 * scale_factor
     print(f"{delay_secs=}")
-    timeout_secs = max(training_epochs, 10) * (18 if device_selection == 'cuda' else 1)
+    timeout_secs = max(training_epochs, 3 * 60 * scale_factor)
     print(f"{timeout_secs=}")
     request_prediction_progress(delay_secs, timeout_secs, "Training...")
     # mark end of training request
@@ -171,12 +181,12 @@ if __name__ == "__main__":
     # User selection
     user_selection = (input('Choose (S) generate samples or (T) perform training: (default: S)') or "S").upper()
     print(f"{user_selection=}")
-    # Device selection
-    device_selection = input('Choose device: (default: cpu)') or 'cpu'
-    print(f"{device_selection=}")
+    # Scale factor
+    scale_factor = int(input('Choose scale up: (default: 1)') or 1)
+    print(f"{scale_factor=}")
 
     # Configure block context size
-    block_size = 256 if device_selection == 'cuda' else 64
+    block_size = 64 * scale_factor
     print(f"{block_size=}")
 
     # Read example in
@@ -193,17 +203,20 @@ if __name__ == "__main__":
     # Create prediction model if not already
     model_resp = request_prediction_progress(log_prefix="Checking...")
     if model_resp.status_code == 404:
+        # Device selection
+        device_selection = input('Choose device: (default: cpu)') or 'cpu'
+        print(f"{device_selection=}")
         # embedding depth number of dimensions
-        embed_depth = 384 if device_selection == 'cuda' else 96
+        embed_depth = 96 * scale_factor
         print(f"{embed_depth=}")
         # number of attention heads
-        attn_heads = 6 if device_selection == 'cuda' else 2
+        attn_heads = max(2, int(1.5 * scale_factor))
         print(f"{attn_heads=}")
         # number of transformer layers
-        tran_layers = 6 if device_selection == 'cuda' else 2
+        tran_layers = max(2, int(1.5 * scale_factor))
         print(f"{tran_layers=}")
         # drop out ratio
-        dropout = 0.2 if device_selection == 'cuda' else 0.05
+        dropout = 0.05 * scale_factor
         print(f"{dropout=}")
         # learning rate
         learning_rate = 3e-4
@@ -261,22 +274,27 @@ if __name__ == "__main__":
         print(f"{num_split_train_items=}")
         num_split_val_items = int(0.1 * num_items)
         print(f"{num_split_val_items=}")
-        split_train_data = encoded_example[:num_split_train_items] * (5 if device_selection == 'cuda' else 1)
+        split_train_data = encoded_example[:num_split_train_items] * int(scale_factor * 2.5)
         print(f"{len(split_train_data)=}")
         split_val_data = encoded_example[num_split_train_items:]
         # Build training data
+        log.info("Making train data split...")
         input_train, target_train = make_training_data(split_train_data)
+        log.info("Making value data split...")
         input_val, target_val = make_training_data(split_val_data)
-        # Preview training data
-        for x, y in zip(input_train[:2], target_train[:2]):
-            print(f"{''.join(vocabulary[ix] for ix in x)} --> {''.join(vocabulary[iy] for iy in y)}")
+        log.info("Done: making training data")
+        preview_training_data = bool((input('Preview training data? (default: N)') or 'N').upper() == 'Y')
+        print(f"{preview_training_data=}")
+        if preview_training_data: # Preview training data
+            for x, y in zip(input_train[:1], target_train[:1]):
+                print(f"{''.join(vocabulary[ix] for ix in x)} --> {''.join(vocabulary[iy] for iy in y)}")
 
         # Ask for training options
-        num_training_epochs = int(input('How many epochs shall we perform training? (default: 1)') or 1)
+        num_training_epochs = int(input('How many epochs shall we perform training? (default: 1000)') or 1000)
         print(f"{num_training_epochs=}")
         batch_size = int(input('Set batch size=(default: 64)') or 64)
         print(f"{batch_size=}")
-        compress_request = (input('Compress request payload?(default: N)') or 'N').upper() == 'Y'
+        compress_request = (input('Compress request payload?(default: Y)') or 'Y').upper() == 'Y'
         print(f"{compress_request=}")
 
         # Run training on split
@@ -291,10 +309,15 @@ if __name__ == "__main__":
 
     else: # Generate sample
         # Ask for number of maximum tokens
-        num_new_tokens_requested = int(input('How many new tokens at most would you like? (default: 10)') or 10)
+        num_new_tokens_requested = int(input('How many new tokens at most would you like? (default: 500)') or 500)
         print(f"{num_new_tokens_requested=}")
+        # Ask for prompt
+        prompt = input('Prompt?') or 'Therapist: What would you like to work on today?'
+        print(f"{prompt=}")
+        encoded_prompt = [[s2i[s] for s in prompt]]
+        print(f"{encoded_prompt=}")
         # Generate tokens
-        encoded_sample = generate([[0]], num_new_tokens_requested)
+        encoded_sample = generate(encoded_prompt, num_new_tokens_requested)
         # Present generated decoded sample
         decoded_sample = ''.join([vocabulary[i] for i in encoded_sample])
         print(decoded_sample)
