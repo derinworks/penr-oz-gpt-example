@@ -155,7 +155,7 @@ def run_training(training_epochs: int, train_batch_size: int, input_data: list[l
     # check progress
     delay_secs = 15 * scale_factor
     print(f"{delay_secs=}")
-    timeout_secs = max(training_epochs, 3 * 60 * scale_factor)
+    timeout_secs = max(training_epochs, 15 * 60 * scale_factor)
     print(f"{timeout_secs=}")
     request_prediction_progress(delay_secs, timeout_secs, "Training...")
     # mark end of training request
@@ -274,7 +274,7 @@ if __name__ == "__main__":
         print(f"{num_split_train_items=}")
         num_split_val_items = int(0.1 * num_items)
         print(f"{num_split_val_items=}")
-        split_train_data = encoded_example[:num_split_train_items] * int(scale_factor * 2.5)
+        split_train_data = encoded_example[:num_split_train_items] * int(scale_factor * 1.25)
         print(f"{len(split_train_data)=}")
         split_val_data = encoded_example[num_split_train_items:]
         # Build training data
@@ -320,4 +320,4 @@ if __name__ == "__main__":
         encoded_sample = generate(encoded_prompt, num_new_tokens_requested)
         # Present generated decoded sample
         decoded_sample = ''.join([vocabulary[i] for i in encoded_sample])
-        print(decoded_sample)
+        print(f"\n{decoded_sample}\n")
